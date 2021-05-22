@@ -34,27 +34,28 @@ namespace MacSwitcher
 
             while (true)
             {
-                await Task.Delay(TestCycleInterval);
-
-                if (await TestNetwork()) continue;
-
-                Log("Wait {0}s to check again ...", RecheckBeforeChangedInternal.TotalSeconds);
-                await Task.Delay(RecheckBeforeChangedInternal);
-
-                var changedDelay = RecheckAfterChangedInternal;
-                while (!await TestNetwork())
+                if (!await TestNetwork())
                 {
-                    var current = mac.ToMacFormat();
-                    mac[mac.Length - 1]--;
-                    var target = mac.ToMacFormat();
-                    var result = await RunCommandAsync("/sbin/ifconfig", TargetIF + " ether " + target);
-                    Log("ifconfig cmd ch mac '{0}' -> '{1}': {2}", current, target, result);
+                    Log("Wait {0}s to check again ...", RecheckBeforeChangedInternal.TotalSeconds);
+                    await Task.Delay(RecheckBeforeChangedInternal);
 
-                    await Task.Delay(changedDelay);
+                    var changedDelay = RecheckAfterChangedInternal;
+                    while (!await TestNetwork())
+                    {
+                        var current = mac.ToMacFormat();
+                        mac[mac.Length - 1]--;
+                        var target = mac.ToMacFormat();
+                        var result = await RunCommandAsync("/sbin/ifconfig", TargetIF + " ether " + target);
+                        Log("ifconfig cmd ch mac '{0}' -> '{1}': {2}", current, target, result);
 
-                    if (changedDelay < MaxRecheckAfterChangedInternal)
-                        changedDelay += AppendAfterChangedInternal;
+                        await Task.Delay(changedDelay);
+
+                        if (changedDelay < MaxRecheckAfterChangedInternal)
+                            changedDelay += AppendAfterChangedInternal;
+                    }
                 }
+
+                await Task.Delay(TestCycleInterval);
             }
         }
 
@@ -85,8 +86,6 @@ namespace MacSwitcher
         static string ToMacFormat(this byte[] bs)
             => bs.Any() ? bs.Aggregate(Builder.Clear(), (sb, b) => sb.AppendFormat(":{0:x02}", b)).Remove(0, 1).ToString() : "";
 
-
-        [ThreadStatic]
         static readonly StringBuilder Builder = new StringBuilder(17);
 
         static readonly IReadOnlyList<string> TestTargets = new[]
