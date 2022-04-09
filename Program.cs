@@ -1,139 +1,159 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
-using System.Net;
-using System.Net.NetworkInformation;
-using System.Text;
-using System.Threading.Tasks;
+﻿
 
-namespace MacSwitcher
-{
-    static class Program
+await new HostBuilder()
+    .UseContentRoot(Environment.CurrentDirectory)
+    .ConfigureAppConfiguration((context, configuration) =>
     {
-        static readonly string TargetIF = "en0";
-        static readonly TimeSpan TestCycleInterval = TimeSpan.FromMinutes(10);
-        static readonly TimeSpan RecheckBeforeChangedInternal = TimeSpan.FromSeconds(30);
-        static readonly TimeSpan RecheckAfterChangedInternal = TimeSpan.FromSeconds(30);
-        static readonly TimeSpan AppendAfterChangedInternal = TimeSpan.FromSeconds(10);
-        static readonly TimeSpan MaxRecheckAfterChangedInternal = TimeSpan.FromMinutes(1);
-        static readonly int TestNetworkTimeoutMs = (int)TimeSpan.FromSeconds(6).TotalMilliseconds;
-
-        static async Task Main(string[] args)
+        configuration.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true);
+    })
+    .ConfigureLogging((context, logging) =>
+    {
+        logging.AddSimpleConsole(options =>
         {
-            await Task.Yield();
+            options.SingleLine = true;
+            options.TimestampFormat = "[yyyy/MM/dd HH:mm:ss.ff] ";
+        });
+        logging.AddConfiguration(context.Configuration.GetSection("Logging"));
+    })
+    .ConfigureServices((context, services) =>
+    {
+        services.Configure<MacSwitcherOptiions>(context.Configuration.GetSection("Options"));
+        services.AddHostedService<MacSwitcher>();
+    })
+    .RunConsoleAsync();
 
-            var mac = NetworkInterface.GetAllNetworkInterfaces()
-                .First(nif => nif.Name.Equals(TargetIF, StringComparison.Ordinal))
-                .GetPhysicalAddress().GetAddressBytes();
-            Log("current '{0}' mac '{1}'", TargetIF, mac.ToMacFormat());
+public sealed class MacSwitcherOptiions
+{
+    public string TargetIF { get; set; } = "en0";
 
-            var test = await RunCommandAsync("/sbin/ifconfig", TargetIF + " ether");
-            Log("test ifconfig cmd: {0}", test);
+    public TimeSpan TestCycleInterval { get; set; } = TimeSpan.FromMinutes(10);
+    public TimeSpan RecheckBeforeChangedInternal { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan RecheckAfterChangedInternal { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan AppendAfterChangedInternal { get; set; } = TimeSpan.FromSeconds(10);
+    public TimeSpan MaxRecheckAfterChangedInternal { get; set; } = TimeSpan.FromMinutes(1);
 
-            while (true)
+    public HashSet<string> TestTargets { get; set; } = new();
+
+    public static readonly IReadOnlyCollection<string> DefaultTestTargets = new[]
+    {
+        "https://discord.com/",
+        "https://twitter.com/",
+        "https://www.amazon.com/",
+        "https://www.apple.com/",
+        "https://www.bing.com/",
+        "https://www.facebook.com/",
+        "https://www.google.com/",
+        "https://www.instagram.com/",
+        "https://www.linkedin.com/",
+        "https://www.netflix.com/tw/",
+        "https://www.microsoft.com/",
+        "https://www.pinterest.com/",
+        "https://www.reddit.com/",
+        "https://www.twitch.tv/",
+        "https://www.wikipedia.org/",
+        "https://www.yahoo.com/",
+        "https://www.youtube.com/"
+    };
+}
+
+public sealed class MacSwitcher : BackgroundService
+{
+    readonly ILogger Logger;
+    readonly IOptionsMonitor<MacSwitcherOptiions> Monitor;
+
+    readonly StringBuilder Builder = new(capacity: 17);
+    readonly Random Random = new();
+    readonly HttpClient HttpClient = new();
+
+    public MacSwitcher(ILogger<MacSwitcher> logger, IOptionsMonitor<MacSwitcherOptiions> monitor)
+    {
+        Logger = logger;
+        Monitor = monitor;
+    }
+
+    string ToMacFormat(byte[] bs)
+        => bs.Any() ? bs.Aggregate(Builder.Clear(), (sb, b) => sb.AppendFormat(":{0:x02}", b)).Remove(0, 1).ToString() : "";
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await Task.Yield();
+
+        var options = Monitor.CurrentValue;
+        var ifName = options.TargetIF;
+        var mac = NetworkInterface.GetAllNetworkInterfaces()
+            .First(nif => nif.Name.Equals(ifName, StringComparison.Ordinal))
+            .GetPhysicalAddress().GetAddressBytes();
+        Logger.LogInformation("current '{0}' mac '{1}'", ifName, ToMacFormat(mac));
+
+        var test = await RunCommandAsync("/sbin/ifconfig", ifName + " ether");
+        Logger.LogInformation("test ifconfig cmd: {0}", test);
+
+        while (true)
+        {
+            var targets = options.TestTargets is { Count: > 0 } ts ? ts : MacSwitcherOptiions.DefaultTestTargets;
+            if (!await TestNetwork(targets))
             {
-                if (!await TestNetwork())
+                var afterChangedInterval = options.RecheckBeforeChangedInternal;
+                Logger.LogInformation("Wait {0}s to check again ...", afterChangedInterval.TotalSeconds);
+                await Task.Delay(afterChangedInterval);
+
+                var changedDelay = options.RecheckAfterChangedInternal;
+                while (!await TestNetwork(targets))
                 {
-                    Log("Wait {0}s to check again ...", RecheckBeforeChangedInternal.TotalSeconds);
-                    await Task.Delay(RecheckBeforeChangedInternal);
+                    var current = ToMacFormat(mac);
+                    mac[mac.Length - 1]--;
+                    var target = ToMacFormat(mac);
+                    var result = await RunCommandAsync("/sbin/ifconfig", options.TargetIF + " ether " + target);
+                    Logger.LogWarning("ifconfig cmd ch mac '{0}' -> '{1}': {2}", current, target, result);
 
-                    var changedDelay = RecheckAfterChangedInternal;
-                    while (!await TestNetwork())
-                    {
-                        var current = mac.ToMacFormat();
-                        mac[mac.Length - 1]--;
-                        var target = mac.ToMacFormat();
-                        var result = await RunCommandAsync("/sbin/ifconfig", TargetIF + " ether " + target);
-                        Log("ifconfig cmd ch mac '{0}' -> '{1}': {2}", current, target, result);
+                    await Task.Delay(changedDelay);
 
-                        await Task.Delay(changedDelay);
-
-                        if (changedDelay < MaxRecheckAfterChangedInternal)
-                            changedDelay += AppendAfterChangedInternal;
-                    }
+                    if (changedDelay < options.MaxRecheckAfterChangedInternal)
+                        changedDelay += options.AppendAfterChangedInternal;
                 }
-
-                await Task.Delay(TestCycleInterval);
             }
+
+            await Task.Delay(options.TestCycleInterval);
+            options = Monitor.CurrentValue;
         }
+    }
 
-        public static async Task<int> RunCommandAsync(string command, string args)
+    async Task<bool> TestNetwork(IReadOnlyCollection<string> targets)
+    {
+        var target = targets.ElementAt(Random.Next(targets.Count));
+        try
         {
-            Log("RunCommandAsync: \"{0}\" {1}", command, args);
-            var info = new ProcessStartInfo(command, args)
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                StandardOutputEncoding = Encoding.UTF8,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true,
-            };
-            using var process = Process.Start(info);
-            do await Task.Yield(); while (!process.WaitForExit(33));
-            var stringBuilder = new StringBuilder();
-            stringBuilder.AppendLine(process.StandardOutput.ReadToEnd());
-            stringBuilder.AppendLine(process.StandardError.ReadToEnd());
-            Log(stringBuilder.ToString());
-            return process.ExitCode;
+            var content = await HttpClient.GetStringAsync(target);
+            if (string.IsNullOrWhiteSpace(content))
+                throw new Exception("Context empty");
+            Logger.LogInformation("TestNetwork Succeed '{0}'", target);
+            return true;
         }
-
-        static void Log(string format, params object[] args)
-            => Console.WriteLine("{0:yyyy/MM/dd HH:mm:ss}: {1}", DateTime.Now, args?.Any() ?? false ? string.Format(format, args) : format);
-
-        static string ToMacFormat(this byte[] bs)
-            => bs.Any() ? bs.Aggregate(Builder.Clear(), (sb, b) => sb.AppendFormat(":{0:x02}", b)).Remove(0, 1).ToString() : "";
-
-        static readonly StringBuilder Builder = new StringBuilder(17);
-
-        static readonly IReadOnlyList<string> TestTargets = new[]
+        catch (Exception ex)
         {
-            "https://discord.com/",
-            "https://twitter.com/",
-            "https://www.amazon.com/",
-            "https://www.apple.com/",
-            "https://www.bing.com/",
-            "https://www.facebook.com/",
-            "https://www.google.com/",
-            "https://www.instagram.com/",
-            "https://www.linkedin.com/",
-            "https://www.netflix.com/tw/",
-            "https://www.microsoft.com/",
-            "https://www.pinterest.com/",
-            "https://www.reddit.com/",
-            "https://www.twitch.tv/",
-            "https://www.wikipedia.org/",
-            "https://www.yahoo.com/",
-            "https://www.youtube.com/",
+            Logger.LogWarning("TestNetwork Fault '{0}': {1}", target, ex.Message);
+            return false;
+        }
+    }
+
+    public async Task<int> RunCommandAsync(string command, string args)
+    {
+        Logger.LogInformation("RunCommandAsync: \"{0}\" {1}", command, args);
+        var info = new ProcessStartInfo(command, args)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            StandardOutputEncoding = Encoding.UTF8,
+            RedirectStandardError = true,
+            RedirectStandardOutput = true,
         };
-
-        static readonly Random Random = new Random();
-
-        static string FetchTestTarget() => TestTargets[Random.Next(TestTargets.Count)];
-
-        static async Task<bool> TestNetwork()
-        {
-            var target = FetchTestTarget();
-            try
-            {
-                var request = WebRequest.CreateHttp(target);
-                request.Timeout = request.ReadWriteTimeout = TestNetworkTimeoutMs;
-                using var response = await request.GetResponseAsync();
-                using var stream = response.GetResponseStream();
-                using var reader = new StreamReader(stream);
-                var content = await reader.ReadToEndAsync();
-                if (string.IsNullOrWhiteSpace(content))
-                    throw new Exception("Context empty");
-                Log("TestNetwork Succeed '{0}'", target);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Log("TestNetwork Fault '{0}': {1}", target, ex.Message);
-                return false;
-            }
-        }
+        using var process = Process.Start(info)!;
+        do await Task.Yield(); while (!process.WaitForExit(33));
+        var stringBuilder = new StringBuilder();
+        stringBuilder.AppendLine(process.StandardOutput.ReadToEnd());
+        stringBuilder.AppendLine(process.StandardError.ReadToEnd());
+        Logger.LogInformation(stringBuilder.ToString());
+        return process.ExitCode;
     }
 }
